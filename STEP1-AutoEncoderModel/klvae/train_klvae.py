@@ -890,7 +890,7 @@ def main():
                 )
 
                 # handle kl_loss
-                if args.ft_decoder_only:    # only finetune decoder -> latent space fixed, NO kl_loss
+                if args.ft_decoder_only:    
                     # remove kl term from loss, bc when we only train the decoder, the latent is untouched
                     # and the kl loss describes the distribution of the latent
                     kl_loss = torch.tensor(0., requires_grad=False).to(device=accelerator.device)    # prevent logging error
@@ -898,6 +898,10 @@ def main():
                     kl_loss = posterior.kl().mean() # get kl_loss
 
                 # final loss (for finetuning)
+                #   "reconstruction loss" setting (according to stabilityai's official vae finetuning repo on huggingface):
+                #   1. `L1 + LPIPS` for the first 2/3 epochs        (we ONLY use this one!)
+                #   2. `L2 + 0.1 * LPIPS` for the last 1/3 epochs
+                #   In addition, the weight between reconstruction loss and perceptual loss is set to 1 following the community
                 reconstruction_loss = recon_loss + perceptual_loss  # "reconstruction loss" in VAE
                 loss = reconstruction_loss + kl_loss
 
