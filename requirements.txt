@@ -1,3 +1,6 @@
 # tested with conda environment python=3.9
 diffusers[torch]    # diffusers==0.32.2, torch==2.5.1
 nibabel
+timm
+datasets
+albumentations

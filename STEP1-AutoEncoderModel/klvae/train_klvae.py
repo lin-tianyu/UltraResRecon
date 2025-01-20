@@ -610,7 +610,7 @@ def main():
 
     if args.model_config_name_or_path is None and args.pretrained_model_name_or_path is None:
         model = AutoencoderKL() # would NEVER be used
-    elif args.pretrained_model_name_or_path is not None:    # NOTE: start from pretrainde model!!!
+    elif args.pretrained_model_name_or_path is not None:    # NOTE: start from pretrained model!!!
         model = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")  # focus on autoencoder
     else:   # build scratch model from config
         config = AutoencoderKL.load_config(args.model_config_name_or_path)
@@ -732,6 +732,7 @@ def main():
             data_files["train"] = os.path.join(args.train_data_dir, "*")
         dataset = dict()
         dataset["train"] = glob.glob(os.path.join(data_files["train"]))
+        print(len(dataset["train"]), dataset["train"][:5])
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
@@ -742,7 +743,7 @@ def main():
             return torch.from_numpy(img).permute(2, 0, 1)  # Convert (H, W, C) → (C, H, W)
     train_transforms = A.Compose([
         A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_LINEAR),
-        A.RandomResizedCrop(args.resolution, args.resolution, scale=(0.5, 1.0), ratio=1., p=0.5),
+        A.RandomResizedCrop((args.resolution, args.resolution), scale=(0.5, 1.0), ratio=(1., 1.), p=0.5),
         A.HorizontalFlip(p=0.5),
         A.Rotate(limit=90, p=0.5),
         HWCarrayToCHWtensor(p=1.),
