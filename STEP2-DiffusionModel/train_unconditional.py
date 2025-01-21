@@ -44,6 +44,7 @@ from transformers.utils import ContextManagers
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
@@ -56,8 +57,8 @@ if is_wandb_available():
     import wandb
 
 
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.33.0.dev0")
+# # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+# check_min_version("0.33.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 

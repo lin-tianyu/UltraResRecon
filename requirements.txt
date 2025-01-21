@@ -4,3 +4,4 @@ nibabel
 timm
 datasets
 albumentations
+wandb

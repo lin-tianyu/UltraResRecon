@@ -158,7 +158,7 @@ def load_CT_slice(ct_path, slice_idx=None):
             ct_slice = np.asarray(nii.dataobj[:, :, slice_idx:slice_idx + 3]).astype(np.float32)   # lazy loading, prevent reading the entire CT
             break
         except: # if broken, randomly select until select the non-broken slice
-            print(f"\033[31mBroken slice: {ct_path}, slice {slice_idx}\033[0m")
+            print(f"\033[31mBroken slice: {ct_path.split('/')[-2]}, slice {slice_idx}\033[0m")
             slice_idx = random.randint(0, z_shape - 3)
     assert not np.any(np.isnan(ct_slice))
 

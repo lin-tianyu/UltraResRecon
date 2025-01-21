@@ -156,7 +156,7 @@ def load_CT_slice(ct_path, slice_idx=None):
             ct_slice = np.asarray(nii.dataobj[:, :, slice_idx:slice_idx + 3]).astype(np.float32)   # lazy loading, prevent reading the entire CT
             break
         except: # if broken, randomly select until select the non-broken slice
-            print(f"\033[31mBroken slice: {ct_path}, slice {slice_idx}\033[0m")
+            print(f"\033[31mBroken slice: {ct_path.split('/')[-2]}, slice {slice_idx}\033[0m")
             slice_idx = random.randint(0, z_shape - 3)
     assert not np.any(np.isnan(ct_slice))
 
@@ -261,6 +261,12 @@ def parse_args():
         help="The loss function for vae reconstruction loss.",
     )
     parser.add_argument(
+        "--kl_weight",
+        type=float,
+        default=1e-6,
+        help="The weight of kl_loss. Default value from the original stable diffusion implementaion",
+    )
+    parser.add_argument(
         "--timm_model_offset",
         type=int,
         default=0,
@@ -342,7 +348,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="klvae-output",
+        default="klvae-output-KL-weight-0",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -611,6 +617,8 @@ def main():
     if args.model_config_name_or_path is None and args.pretrained_model_name_or_path is None:
         model = AutoencoderKL() # would NEVER be used
     elif args.pretrained_model_name_or_path is not None:    # NOTE: start from pretrained model!!!
+        if accelerator.is_local_main_process:
+            print("\033[31mStarting from Stable Diffusion 1.5's KL-VAE ckpt!\033[0m")
         model = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")  # focus on autoencoder
     else:   # build scratch model from config
         config = AutoencoderKL.load_config(args.model_config_name_or_path)
@@ -732,7 +740,8 @@ def main():
             data_files["train"] = os.path.join(args.train_data_dir, "*")
         dataset = dict()
         dataset["train"] = glob.glob(os.path.join(data_files["train"]))
-        print(len(dataset["train"]), dataset["train"][:5])
+        if accelerator.is_local_main_process:
+            print(f"\033[32mFound {len(dataset['train'])} CT scans. We train them all.\033[0m")
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
@@ -854,8 +863,12 @@ def main():
     )
     # As stated above, we are not doing epoch based training here, but just using this for book keeping and being able to
     # reuse the same training loop with other datasets/loaders.
+    # kl_weight = torch.tensor(args.kl_weight).to(device=accelerator.device)
     for epoch in range(first_epoch, args.num_train_epochs):
         model.train()
+        if accelerator.distributed_type != DistributedType.NO: 
+            raise NotImplementedError("Not supportting distributed learning yet! See details at README.")
+            unwrapped_model = accelerator.unwrap_model(model)
         for i, batch in enumerate(train_dataloader):
             pixel_values = batch["pixel_values"]    # range from 0 to 1 !
             pixel_values = pixel_values.to(accelerator.device, non_blocking=True)
@@ -868,10 +881,19 @@ def main():
 
             optimizer.zero_grad()
 
-            encoding = model.encode(pixel_values)
-            posterior = encoding.latent_dist    # the latent distribution being learned
-            latents = posterior.sample()    # sample from posterior to get the latent representation
-            reconstructed = model.decode(latents).sample    # decode the latent to get the final reconstruction
+            if accelerator.distributed_type != DistributedType.NO:  
+                # USING distributed learning
+                # model wrapped by accelerator, so use the unwrapped model to get to the submodules.
+                raise NotImplementedError("Not supportting distributed learning yet! See details at README.")
+                posterior = unwrapped_model.encode(pixel_values).latent_dist    # the latent distribution being learned
+                latents = posterior.sample()    # sample from posterior to get the latent representation
+                reconstructed = unwrapped_model.decode(latents).sample    # decode the latent to get the final reconstruction
+            else:
+                # NOT using distributed learning
+                # no wrapper, thus can directly call the submodules
+                posterior = model.encode(pixel_values).latent_dist      # the latent distribution being learned
+                latents = posterior.sample()    # sample from posterior to get the latent representation
+                reconstructed = model.decode(latents).sample    # decode the latent to get the final reconstruction
 
             with accelerator.accumulate(model): # for accumulation steps
                 # 1st term of "reconstruction loss"
@@ -901,9 +923,9 @@ def main():
                 #   "reconstruction loss" setting (according to stabilityai's official vae finetuning repo on huggingface):
                 #   1. `L1 + LPIPS` for the first 2/3 epochs        (we ONLY use this one!)
                 #   2. `L2 + 0.1 * LPIPS` for the last 1/3 epochs
-                #   In addition, the weight between reconstruction loss and perceptual loss is set to 1 following the community
+                #   In addition, the weight between reconstruction loss and perceptual loss is set based on original SD implementation
                 reconstruction_loss = recon_loss + perceptual_loss  # "reconstruction loss" in VAE
-                loss = reconstruction_loss + kl_loss
+                loss = reconstruction_loss + args.kl_weight * kl_loss
 
 
                 # Gather the losses across all processes for logging (if we use distributed training).

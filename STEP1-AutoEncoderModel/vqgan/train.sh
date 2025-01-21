@@ -7,6 +7,6 @@ accelerate launch train_vqgan.py \
   --dataloader_num_workers=8 \
   --report_to="wandb" \
   --model_config_name_or_path="models/vq-f8/config.json" \
-  --max_train_steps=100000 \
+  --max_train_steps=100_000 \
   --discriminator_iter_start=10000 \
   --vae_loss="l1"
