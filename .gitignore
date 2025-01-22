@@ -3,6 +3,8 @@ STEP1-AutoEncoderModel/vqgan/wandb/*
 STEP1-AutoEncoderModel/klvae/klvae*/*
 STEP1-AutoEncoderModel/klvae/wandb/*
 
+exampl*.png
+
 */__pycache__/*
 # STEP1-AutoEncoderModel/vqgan/__pycache__/*
 # STEP1-AutoEncoderModel/klvae/__pycache__/*

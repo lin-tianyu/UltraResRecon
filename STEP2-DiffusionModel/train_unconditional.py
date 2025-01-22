@@ -35,7 +35,7 @@ from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from huggingface_hub import create_repo, upload_folder
+# from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -44,13 +44,17 @@ from transformers.utils import ContextManagers
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
-from diffusers import UNet2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+
+
+from diffusers import UNet2DModel   # unconditional UNet model 
+from diffusers import LDMPipeline   # unconditional LDM pipeline
+from pipeline import CTRecoveryLDMPipeline  # unconditional LDM pipeline with given CT slice as starting point
 
 
 if is_wandb_available():
@@ -67,90 +71,90 @@ DATASET_NAME_MAPPING = {
 }
 
 
-def save_model_card(
-    args,
-    repo_id: str,
-    images: list = None,
-    repo_folder: str = None,
-):
-    img_str = ""
-    if len(images) > 0:
-        image_grid = make_image_grid(images, 1, len(args.validation_prompts))
-        image_grid.save(os.path.join(repo_folder, "val_imgs_grid.png"))
-        img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
+# def save_model_card(
+#     args,
+#     repo_id: str,
+#     images: list = None,
+#     repo_folder: str = None,
+# ):
+#     img_str = ""
+#     if len(images) > 0:
+#         image_grid = make_image_grid(images, 1, len(args.validation_prompts))
+#         image_grid.save(os.path.join(repo_folder, "val_imgs_grid.png"))
+#         img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
 
-    model_description = f"""
-# Text-to-image finetuning - {repo_id}
+#     model_description = f"""
+# # Text-to-image fine-tuning - {repo_id}
 
-This pipeline was finetuned from **{args.pretrained_model_name_or_path}** on the **{args.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {args.validation_prompts}: \n
-{img_str}
+# This pipeline was finetuned from **{args.pretrained_model_name_or_path}** on the **{args.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {args.validation_prompts}: \n
+# {img_str}
 
-## Pipeline usage
+# ## Pipeline usage
 
-You can use the pipeline like so:
+# You can use the pipeline like so:
 
-```python
-from diffusers import DiffusionPipeline
-import torch
+# ```python
+# from diffusers import DiffusionPipeline
+# import torch
 
-pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
-prompt = "{args.validation_prompts[0]}"
-image = pipeline(prompt).images[0]
-image.save("my_image.png")
-```
+# pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
+# prompt = "{args.validation_prompts[0]}"
+# image = pipeline(prompt).images[0]
+# image.save("my_image.png")
+# ```
 
-## Training info
+# ## Training info
 
-These are the key hyperparameters used during training:
+# These are the key hyperparameters used during training:
 
-* Epochs: {args.num_train_epochs}
-* Learning rate: {args.learning_rate}
-* Batch size: {args.train_batch_size}
-* Gradient accumulation steps: {args.gradient_accumulation_steps}
-* Image resolution: {args.resolution}
-* Mixed-precision: {args.mixed_precision}
+# * Epochs: {args.num_train_epochs}
+# * Learning rate: {args.learning_rate}
+# * Batch size: {args.train_batch_size}
+# * Gradient accumulation steps: {args.gradient_accumulation_steps}
+# * Image resolution: {args.resolution}
+# * Mixed-precision: {args.mixed_precision}
 
-"""
-    wandb_info = ""
-    if is_wandb_available():
-        wandb_run_url = None
-        if wandb.run is not None:
-            wandb_run_url = wandb.run.url
+# """
+#     wandb_info = ""
+#     if is_wandb_available():
+#         wandb_run_url = None
+#         if wandb.run is not None:
+#             wandb_run_url = wandb.run.url
 
-    if wandb_run_url is not None:
-        wandb_info = f"""
-More information on all the CLI arguments and the environment are available on your [`wandb` run page]({wandb_run_url}).
-"""
+#     if wandb_run_url is not None:
+#         wandb_info = f"""
+# More information on all the CLI arguments and the environment are available on your [`wandb` run page]({wandb_run_url}).
+# """
 
-    model_description += wandb_info
+#     model_description += wandb_info
 
-    model_card = load_or_create_model_card(
-        repo_id_or_path=repo_id,
-        from_training=True,
-        license="creativeml-openrail-m",
-        base_model=args.pretrained_model_name_or_path,
-        model_description=model_description,
-        inference=True,
-    )
+#     model_card = load_or_create_model_card(
+#         repo_id_or_path=repo_id,
+#         from_training=True,
+#         license="creativeml-openrail-m",
+#         base_model=args.pretrained_model_name_or_path,
+#         model_description=model_description,
+#         inference=True,
+#     )
 
-    tags = ["stable-diffusion", "stable-diffusion-diffusers", "text-to-image", "diffusers", "diffusers-training"]
-    model_card = populate_model_card(model_card, tags=tags)
+#     tags = ["stable-diffusion", "stable-diffusion-diffusers", "text-to-image", "diffusers", "diffusers-training"]
+#     model_card = populate_model_card(model_card, tags=tags)
 
-    model_card.save(os.path.join(repo_folder, "README.md"))
+#     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
-def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+def log_validation(vae, unet, args, accelerator, weight_dtype, epoch):
     logger.info("Running validation... ")
 
     pipeline = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae),
-        text_encoder=accelerator.unwrap_model(text_encoder),
-        tokenizer=tokenizer,
+        # text_encoder=accelerator.unwrap_model(text_encoder),
+        # tokenizer=tokenizer,
         unet=accelerator.unwrap_model(unet),
         safety_checker=None,
-        revision=args.revision,
-        variant=args.variant,
+        # revision=args.revision,
+        # variant=args.variant,
         torch_dtype=weight_dtype,
     )
     pipeline = pipeline.to(accelerator.device)
@@ -211,18 +215,25 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
-        "--revision",
+        "--finetuned_vae_name_or_path",
         type=str,
         default=None,
-        required=False,
-        help="Revision of pretrained model identifier from huggingface.co/models.",
+        required=True,
+        help="Path to finetuned model or model identifier of the pretrained model from huggingface.co/models.",
     )
-    parser.add_argument(
-        "--variant",
-        type=str,
-        default=None,
-        help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
-    )
+    # parser.add_argument(
+    #     "--revision",
+    #     type=str,
+    #     default=None,
+    #     required=False,
+    #     help="Revision of pretrained model identifier from huggingface.co/models.",
+    # )
+    # parser.add_argument(
+    #     "--variant",
+    #     type=str,
+    #     default=None,
+    #     help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
+    # )
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -362,14 +373,14 @@ def parse_args():
         help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
         "More details here: https://arxiv.org/abs/2303.09556.",
     )
-    parser.add_argument(
-        "--dream_training",
-        action="store_true",
-        help=(
-            "Use the DREAM training method, which makes training more efficient and accurate at the ",
-            "expense of doing an extra forward pass. See: https://arxiv.org/abs/2312.00210",
-        ),
-    )
+    # parser.add_argument(
+    #     "--dream_training",
+    #     action="store_true",
+    #     help=(
+    #         "Use the DREAM training method, which makes training more efficient and accurate at the ",
+    #         "expense of doing an extra forward pass. See: https://arxiv.org/abs/2312.00210",
+    #     ),
+    # )
     parser.add_argument(
         "--dream_detail_preservation",
         type=float,
@@ -413,7 +424,7 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+    # parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
     parser.add_argument(
         "--prediction_type",
@@ -575,16 +586,16 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-        if args.push_to_hub:
-            repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
-            ).repo_id
+        # if args.push_to_hub:
+        #     repo_id = create_repo(
+        #         repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+        #     ).repo_id
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    )
+    # tokenizer = CLIPTokenizer.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+    # )
 
     def deepspeed_zero_init_disabled_context_manager():
         """
@@ -606,30 +617,33 @@ def main():
     # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
     # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-        text_encoder = CLIPTextModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-        )
+        # text_encoder = CLIPTextModel.from_pretrained(
+        #     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+        # )
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
         )
 
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
-    )
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+    # )
+    unet = UNet2DModel()    # TODO: config
+    # unect_config = UNet2DModel.load_config()
+    # unet = UNet2DModel.from_config(unect_config)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    # text_encoder.requires_grad_(False)
     unet.train()
 
     # Create EMA for the unet.
     if args.use_ema:
-        ema_unet = UNet2DConditionModel.from_pretrained(
+        ema_unet = UNet2DModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
         )
         ema_unet = EMAModel(
             ema_unet.parameters(),
-            model_cls=UNet2DConditionModel,
+            model_cls=UNet2DModel,
             model_config=ema_unet.config,
             foreach=args.foreach_ema,
         )
@@ -664,7 +678,7 @@ def main():
         def load_model_hook(models, input_dir):
             if args.use_ema:
                 load_model = EMAModel.from_pretrained(
-                    os.path.join(input_dir, "unet_ema"), UNet2DConditionModel, foreach=args.foreach_ema
+                    os.path.join(input_dir, "unet_ema"), UNet2DModel, foreach=args.foreach_ema
                 )
                 ema_unet.load_state_dict(load_model.state_dict())
                 if args.offload_ema:
@@ -678,7 +692,7 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -770,23 +784,23 @@ def main():
             )
 
     # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
+    # # We need to tokenize input captions and transform the images.
+    # def tokenize_captions(examples, is_train=True):
+    #     captions = []
+    #     for caption in examples[caption_column]:
+    #         if isinstance(caption, str):
+    #             captions.append(caption)
+    #         elif isinstance(caption, (list, np.ndarray)):
+    #             # take a random caption if there are multiple
+    #             captions.append(random.choice(caption) if is_train else caption[0])
+    #         else:
+    #             raise ValueError(
+    #                 f"Caption column `{caption_column}` should contain either strings or lists of strings."
+    #             )
+    #     inputs = tokenizer(
+    #         captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+    #     )
+    #     return inputs.input_ids
 
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
@@ -802,7 +816,7 @@ def main():
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
+        # examples["input_ids"] = tokenize_captions(examples)
         return examples
 
     with accelerator.main_process_first():
@@ -814,8 +828,8 @@ def main():
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        # input_ids = torch.stack([example["input_ids"] for example in examples])
+        return {"pixel_values": pixel_values}#, "input_ids": input_ids}
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -867,7 +881,7 @@ def main():
         args.mixed_precision = accelerator.mixed_precision
 
     # Move text_encode and vae to gpu and cast to weight_dtype
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    # text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -975,7 +989,7 @@ def main():
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+                # encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -989,20 +1003,21 @@ def main():
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                if args.dream_training:
-                    noisy_latents, target = compute_dream_and_update_latents(
-                        unet,
-                        noise_scheduler,
-                        timesteps,
-                        noise,
-                        noisy_latents,
-                        target,
-                        encoder_hidden_states,
-                        args.dream_detail_preservation,
-                    )
+                # if args.dream_training:
+                #     noisy_latents, target = compute_dream_and_update_latents(
+                #         unet,
+                #         noise_scheduler,
+                #         timesteps,
+                #         noise,
+                #         noisy_latents,
+                #         target,
+                #         encoder_hidden_states,
+                #         args.dream_detail_preservation,
+                #     )
 
                 # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                # model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                model_pred = unet(noisy_latents, timesteps, return_dict=False)[0]   # unconditional
 
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1088,8 +1103,8 @@ def main():
                     ema_unet.copy_to(unet.parameters())
                 log_validation(
                     vae,
-                    text_encoder,
-                    tokenizer,
+                    # text_encoder,
+                    # tokenizer,
                     unet,
                     args,
                     accelerator,
@@ -1109,11 +1124,11 @@ def main():
 
         pipeline = StableDiffusionPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
-            text_encoder=text_encoder,
+            # text_encoder=text_encoder,
             vae=vae,
             unet=unet,
-            revision=args.revision,
-            variant=args.variant,
+            # revision=args.revision,
+            # variant=args.variant,
         )
         pipeline.save_pretrained(args.output_dir)
 
@@ -1138,14 +1153,14 @@ def main():
                     image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
                 images.append(image)
 
-        if args.push_to_hub:
-            save_model_card(args, repo_id, images, repo_folder=args.output_dir)
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
+        # if args.push_to_hub:
+        #     save_model_card(args, repo_id, images, repo_folder=args.output_dir)
+        #     upload_folder(
+        #         repo_id=repo_id,
+        #         folder_path=args.output_dir,
+        #         commit_message="End of training",
+        #         ignore_patterns=["step_*", "epoch_*"],
+        #     )
 
     accelerator.end_training()
 
