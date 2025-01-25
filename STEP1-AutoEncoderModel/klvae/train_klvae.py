@@ -171,12 +171,19 @@ def load_CT_slice(ct_path, slice_idx=None):
 
 @torch.no_grad()
 def log_validation(model, args, validation_transform, accelerator, global_step):
+    def postprocess_log_images(images): # (b c h w)[around 0, 1] tensor float32 -> (b h w c)[0, 255] numpy uint8
+        images = torch.clamp(images, 0.0, 1.0)
+        images *= 255.0
+        images = images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+        return images
+
     logger.info("Generating images...")
     dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         dtype = torch.bfloat16
+    
     original_images = []
     for image_path in args.validation_images:   # ct_paths
         for idx in range(0, 200, 50):   # fixed slice idx
@@ -194,14 +201,17 @@ def log_validation(model, args, validation_transform, accelerator, global_step):
     images = torch.cat(images, dim=0)
 
     # Convert to PIL images for visualization
-    # images = (images + 1) / 2   # [-1, 1] -> [0, 1]
-    images = torch.clamp(images, 0.0, 1.0)
-    # original_images = (original_images + 1) / 2 # [-1, 1] -> [0, 1]
-    original_images = torch.clamp(original_images, 0.0, 1.0)
-    images *= 255.0
-    original_images *= 255.0
-    images = images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
-    original_images = original_images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+    # # images = (images + 1) / 2   # [-1, 1] -> [0, 1]
+    # images = torch.clamp(images, 0.0, 1.0)
+    # # original_images = (original_images + 1) / 2 # [-1, 1] -> [0, 1]
+    # original_images = torch.clamp(original_images, 0.0, 1.0)
+    # images *= 255.0
+    # original_images *= 255.0
+    # images = images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+    # original_images = original_images.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+    images = postprocess_log_images(images)
+    original_images = postprocess_log_images(original_images)
+
     images = np.concatenate([original_images, images], axis=2)
     images = [Image.fromarray(image) for image in images]
 
@@ -735,11 +745,12 @@ def main():
             data_dir=args.train_data_dir,
         )
     else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "*")
+        # data_files = {}
+        # if args.train_data_dir is not None:
+        #     data_files["train"] = os.path.join(args.train_data_dir, "*")
         dataset = dict()
-        dataset["train"] = glob.glob(os.path.join(data_files["train"]))
+        # dataset["train"] = glob.glob(os.path.join(data_files["train"]))
+        dataset["train"] = [entry.path for entry in os.scandir(args.train_data_dir)]    
         if accelerator.is_local_main_process:
             print(f"\033[32mFound {len(dataset['train'])} CT scans. We train them all.\033[0m")
         # See more about loading custom images at

@@ -5,3 +5,4 @@ timm
 datasets
 albumentations
 wandb
+h5py

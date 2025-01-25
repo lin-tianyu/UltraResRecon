@@ -3,6 +3,9 @@ STEP1-AutoEncoderModel/vqgan/wandb/*
 STEP1-AutoEncoderModel/klvae/klvae*/*
 STEP1-AutoEncoderModel/klvae/wandb/*
 
+STEP2-DiffusionModel/wandb/*
+STEP2-DiffusionModel/uncond-sd*/*
+
 exampl*.png
 
 */__pycache__/*

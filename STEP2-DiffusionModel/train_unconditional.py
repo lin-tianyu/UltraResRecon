@@ -29,7 +29,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
@@ -39,8 +38,9 @@ from datasets import load_dataset
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
-from transformers.utils import ContextManagers
+# import transformers
+# from transformers import CLIPTextModel, CLIPTokenizer
+# from transformers.utils import ContextManagers
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
@@ -55,6 +55,12 @@ from diffusers.utils.torch_utils import is_compiled_module
 from diffusers import UNet2DModel   # unconditional UNet model 
 from diffusers import LDMPipeline   # unconditional LDM pipeline
 from pipeline import CTRecoveryLDMPipeline  # unconditional LDM pipeline with given CT slice as starting point
+import nibabel as nib
+import albumentations as A
+import cv2
+from PIL import Image
+from torch.optim.lr_scheduler import MultiStepLR
+from dataset import load_CT_slice, HWCarrayToCHWtensor, CTDataset
 
 
 if is_wandb_available():
@@ -66,9 +72,9 @@ if is_wandb_available():
 
 logger = get_logger(__name__, log_level="INFO")
 
-DATASET_NAME_MAPPING = {
-    "lambdalabs/naruto-blip-captions": ("image", "text"),
-}
+# DATASET_NAME_MAPPING = {
+#     "lambdalabs/naruto-blip-captions": ("image", "text"),
+# }
 
 
 # def save_model_card(
@@ -143,22 +149,34 @@ DATASET_NAME_MAPPING = {
 #     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
-def log_validation(vae, unet, args, accelerator, weight_dtype, epoch):
-    logger.info("Running validation... ")
 
-    pipeline = StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=accelerator.unwrap_model(vae),
+@torch.no_grad()
+def log_validation(vae, unet, args, accelerator, weight_dtype, epoch, validation_transform):
+    def postprocess_log_images(images, PIL_Image=False): # (b c h w)[around 0, 1] tensor float32 -> (b h w c)[0, 255] numpy uint8
+        images = images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
+        if not PIL_Image:   # pipeline gives PIL.Image output; VAE/dataloader gives [0, 1] tensor
+            images = np.clip(images, 0.0, 1.0)
+            images *= 255.0
+        return images
+
+    logger.info("Running validation... ")
+    dtype = torch.float32
+
+    pipeline = LDMPipeline.from_pretrained(     # unconditional ct generation
+        "./LDMPipeline",
+        vqvae=accelerator.unwrap_model(vae),
         # text_encoder=accelerator.unwrap_model(text_encoder),
         # tokenizer=tokenizer,
         unet=accelerator.unwrap_model(unet),
-        safety_checker=None,
+        # safety_checker=None,
         # revision=args.revision,
         # variant=args.variant,
         torch_dtype=weight_dtype,
     )
     pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
+    pipeline.set_progress_bar_config(disable=False)
+
+    # CTpipeline = CTRecoveryLDMPipeline()    # input ct to enhance quaility
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
@@ -167,30 +185,60 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, epoch):
         generator = None
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+    
+    original_images = []
+    for image_path in args.validation_images:   # ct_paths
+        for idx in range(0, 200, 50):   # fixed slice idx
+            image = load_CT_slice(image_path, slice_idx=idx)   # (H W C)[0, 1] numpy
+            image = validation_transform(image=image)["image"].to(accelerator.device, dtype=dtype)
+            original_images.append(image[None]) # (3 H W) -> (1 3 H W)
 
-    images = []
-    for i in range(len(args.validation_prompts)):
+    uncond_images = []
+    # images_plus = []
+    for i in range(len(args.validation_images)*2):
         if torch.backends.mps.is_available():
             autocast_ctx = nullcontext()
         else:
             autocast_ctx = torch.autocast(accelerator.device.type)
 
         with autocast_ctx:
-            image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+            uncond_image = pipeline(num_inference_steps=50, generator=generator).images[0]
+            uncond_image = torch.from_numpy(np.array(uncond_image)).permute(2, 0, 1)[None]    # h w c -> 1 c h w
+            # image_plus = CTpipeline(original_images[i], # NOTE: input CT as starting point
+            #                 num_inference_steps=20, generator=generator).images[0]
 
-        images.append(image)
+        uncond_images.append(uncond_image)
+        # images_plus.apend(image_plus)
+    
+    original_images = torch.cat(original_images, dim=0)
+    uncond_images = torch.cat(uncond_images, dim=0)
+    # images_plus = torch.cat(images_plus, dim=0)
+
+    original_images = postprocess_log_images(original_images)
+    uncond_images = postprocess_log_images(uncond_images, PIL_Image=True)
+    # images_plus = postprocess_log_images(images_plus)
+
+    uncond_images = [Image.fromarray(image) for image in uncond_images]
+    # ori_plus_images = np.concatenate([original_images, images_plus], axis=2)
+    # ori_plus_images = [Image.fromarray(image) for image in ori_plus_images]
+
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
+            raise NotImplementedError("tensorboard deprecated!!")
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
         elif tracker.name == "wandb":
             tracker.log(
                 {
-                    "validation": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
-                        for i, image in enumerate(images)
-                    ]
+                    "validation (from noise)": [
+                        wandb.Image(image, caption=f"{i}: generated images")
+                        for i, image in enumerate(uncond_images)
+                    ],
+                    # "validation (from CT)": [
+                    #     wandb.Image(image, caption=f"{i}: original, generated")
+                    #     for i, image in enumerate(ori_plus_images)
+                    # ],
                 }
             )
         else:
@@ -199,7 +247,8 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, epoch):
     del pipeline
     torch.cuda.empty_cache()
 
-    return images
+    # there are nothing to return for
+    # return images 
 
 
 def parse_args():
@@ -260,15 +309,15 @@ def parse_args():
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
-    parser.add_argument(
-        "--image_column", type=str, default="image", help="The column of the dataset containing an image."
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="text",
-        help="The column of the dataset containing a caption or a list of captions.",
-    )
+    # parser.add_argument(
+    #     "--image_column", type=str, default="image", help="The column of the dataset containing an image."
+    # )
+    # parser.add_argument(
+    #     "--caption_column",
+    #     type=str,
+    #     default="text",
+    #     help="The column of the dataset containing a caption or a list of captions.",
+    # )
     parser.add_argument(
         "--max_train_samples",
         type=int,
@@ -279,11 +328,12 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--validation_prompts",
+        "--validation_images",
         type=str,
         default=None,
         nargs="+",
-        help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+        help=("A set of images evaluated every `--validation_steps` and logged to `--report_to`."
+              "NOTE that: these images are used as unconditional reverse process starting point, NOT conditions."),
     )
     parser.add_argument(
         "--output_dir",
@@ -307,20 +357,20 @@ def parse_args():
             " resolution"
         ),
     )
-    parser.add_argument(
-        "--center_crop",
-        default=False,
-        action="store_true",
-        help=(
-            "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
-            " cropped. The images will be resized to the resolution first before cropping."
-        ),
-    )
-    parser.add_argument(
-        "--random_flip",
-        action="store_true",
-        help="whether to randomly flip images horizontally",
-    )
+    # parser.add_argument(
+    #     "--center_crop",
+    #     default=False,
+    #     action="store_true",
+    #     help=(
+    #         "Whether to center crop the input images to the resolution. If not set, the images will be randomly"
+    #         " cropped. The images will be resized to the resolution first before cropping."
+    #     ),
+    # )
+    # parser.add_argument(
+    #     "--random_flip",
+    #     action="store_true",
+    #     help="whether to randomly flip images horizontally",
+    # )
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
@@ -360,11 +410,11 @@ def parse_args():
         default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
+            ' "constant", "constant_with_warmup", "multistep"]'
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
         "--snr_gamma",
@@ -401,16 +451,16 @@ def parse_args():
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
     parser.add_argument("--offload_ema", action="store_true", help="Offload EMA model to CPU during training step.")
     parser.add_argument("--foreach_ema", action="store_true", help="Use faster foreach implementation of EMAModel.")
-    parser.add_argument(
-        "--non_ema_revision",
-        type=str,
-        default=None,
-        required=False,
-        help=(
-            "Revision of pretrained non-ema model identifier. Must be a branch, tag or git identifier of the local or"
-            " remote repository specified with --pretrained_model_name_or_path."
-        ),
-    )
+    # parser.add_argument(
+    #     "--non_ema_revision",
+    #     type=str,
+    #     default=None,
+    #     required=False,
+    #     help=(
+    #         "Revision of pretrained non-ema model identifier. Must be a branch, tag or git identifier of the local or"
+    #         " remote repository specified with --pretrained_model_name_or_path."
+    #     ),
+    # )
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
@@ -471,7 +521,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=1000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -497,15 +547,15 @@ def parse_args():
     )
     parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
     parser.add_argument(
-        "--validation_epochs",
+        "--validation_steps",
         type=int,
-        default=5,
-        help="Run validation every X epochs.",
+        default=1000,
+        help="Run validation every X steps.",
     )
     parser.add_argument(
         "--tracker_project_name",
         type=str,
-        default="text2image-fine-tune",
+        default="uncond-sd-train",
         help=(
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
@@ -521,9 +571,9 @@ def parse_args():
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
-    # default to using the same revision for the non-ema model if not specified
-    if args.non_ema_revision is None:
-        args.non_ema_revision = args.revision
+    # # default to using the same revision for the non-ema model if not specified
+    # if args.non_ema_revision is None:
+    #     args.non_ema_revision = args.revision
 
     return args
 
@@ -537,15 +587,15 @@ def main():
             " Please use `huggingface-cli login` to authenticate with the Hub."
         )
 
-    if args.non_ema_revision is not None:
-        deprecate(
-            "non_ema_revision!=None",
-            "0.15.0",
-            message=(
-                "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
-                " use `--variant=non_ema` instead."
-            ),
-        )
+    # if args.non_ema_revision is not None:
+    #     deprecate(
+    #         "non_ema_revision!=None",
+    #         "0.15.0",
+    #         message=(
+    #             "Downloading 'non_ema' weights from revision branches of the Hub is deprecated. Please make sure to"
+    #             " use `--variant=non_ema` instead."
+    #         ),
+    #     )
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -570,11 +620,11 @@ def main():
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_warning()
+        # transformers.utils.logging.set_verbosity_warning()
         diffusers.utils.logging.set_verbosity_info()
     else:
         datasets.utils.logging.set_verbosity_error()
-        transformers.utils.logging.set_verbosity_error()
+        # transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
     # If passed along, set the training seed now.
@@ -597,39 +647,41 @@ def main():
     #     args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     # )
 
-    def deepspeed_zero_init_disabled_context_manager():
-        """
-        returns either a context list that includes one that will disable zero.Init or an empty context list
-        """
-        deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
-        if deepspeed_plugin is None:
-            return []
+    # def deepspeed_zero_init_disabled_context_manager():
+    #     """
+    #     returns either a context list that includes one that will disable zero.Init or an empty context list
+    #     """
+    #     deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
+    #     if deepspeed_plugin is None:
+    #         return []
 
-        return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
+    #     return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
 
-    # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
-    # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
-    # will try to assign the same optimizer with the same weights to all models during
-    # `deepspeed.initialize`, which of course doesn't work.
-    #
-    # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
-    # frozen models from being partitioned during `zero.Init` which gets called during
-    # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
-    # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
-    with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-        # text_encoder = CLIPTextModel.from_pretrained(
-        #     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-        # )
-        vae = AutoencoderKL.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
-        )
+    # # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
+    # # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
+    # # will try to assign the same optimizer with the same weights to all models during
+    # # `deepspeed.initialize`, which of course doesn't work.
+    # #
+    # # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
+    # # frozen models from being partitioned during `zero.Init` which gets called during
+    # # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
+    # # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
+    # with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+    #     # text_encoder = CLIPTextModel.from_pretrained(
+    #     #     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    #     # )
+
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae",# revision=args.revision, variant=args.variant
+    )
 
     # unet = UNet2DConditionModel.from_pretrained(
     #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     # )
-    unet = UNet2DModel()    # TODO: config
-    # unect_config = UNet2DModel.load_config()
-    # unet = UNet2DModel.from_config(unect_config)
+    # unet = UNet2DModel(in_channels=4, out_channels=4)    
+    unet_config_file = "./LDMPipeline/unet/config.json"         # NOTE: pre-defined!
+    unect_config = UNet2DModel.load_config(unet_config_file)
+    unet = UNet2DModel.from_config(unect_config)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -702,6 +754,7 @@ def main():
         accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
+        print("Using gradient_checkpointing!")
         unet.enable_gradient_checkpointing()
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -749,39 +802,44 @@ def main():
             data_dir=args.train_data_dir,
         )
     else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
+        # data_files = {}
+        # if args.train_data_dir is not None:
+        #     data_files["train"] = os.path.join(args.train_data_dir, "**")
+        dataset = dict()
+        dataset["train"] = [entry.path for entry in os.scandir(args.train_data_dir)
+                            if entry.name.startswith("BDMAP_A") or entry.name.startswith("BDMAP_V")]    # FELIX data
+        if accelerator.is_local_main_process:
+            print(f"\033[32mFound {len(dataset['train'])} FELIX CT scans for training...\033[0m")
+        # dataset = load_dataset(
+        #     "imagefolder",
+        #     data_files=data_files,
+        #     cache_dir=args.cache_dir,
+        # )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+    # column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
+    # dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
+    # if args.image_column is None:
+    #     image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+    # else:
+    #     image_column = args.image_column
+    #     if image_column not in column_names:
+    #         raise ValueError(
+    #             f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+    #         )
+    # if args.caption_column is None:
+    #     caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+    # else:
+    #     caption_column = args.caption_column
+    #     if caption_column not in column_names:
+    #         raise ValueError(
+    #             f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+    #         )
 
     # Preprocessing the datasets.
     # # We need to tokenize input captions and transform the images.
@@ -803,30 +861,47 @@ def main():
     #     return inputs.input_ids
 
     # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
+    # train_transforms = transforms.Compose(
+    #     [
+    #         transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+    #         transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+    #         transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize([0.5], [0.5]),
+    #     ]
+    # )
+    # class HWCarrayToCHWtensor(A.ImageOnlyTransform):
+    #     def apply(self, img, **kwargs):
+    #         return torch.from_numpy(img).permute(2, 0, 1)  # Convert (H, W, C) → (C, H, W)
+    train_transforms = A.Compose([
+        A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_LINEAR),
+        A.RandomResizedCrop((args.resolution, args.resolution), scale=(0.5, 1.0), ratio=(1., 1.), p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.Rotate(limit=90, p=0.5),
+        HWCarrayToCHWtensor(p=1.),
+    ])
+    validation_transform = A.Compose([
+        A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_LINEAR),
+        HWCarrayToCHWtensor(p=1.),
+    ])
 
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        # examples["input_ids"] = tokenize_captions(examples)
-        return examples
+    train_dataset = CTDataset(dataset["train"], transform=train_transforms)
 
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+    # def preprocess_train(examples):
+    #     images = [image.convert("RGB") for image in examples[image_column]]
+    #     examples["pixel_values"] = [train_transforms(image) for image in images]
+    #     # examples["input_ids"] = tokenize_captions(examples)
+    #     return examples
+
+    # with accelerator.main_process_first():
+    #     if args.max_train_samples is not None:
+    #         dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+    #     # Set the training transforms
+    #     train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        # pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = torch.stack([example for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         # input_ids = torch.stack([example["input_ids"] for example in examples])
         return {"pixel_values": pixel_values}#, "input_ids": input_ids}
@@ -838,6 +913,7 @@ def main():
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        pin_memory=True
     )
 
     # Scheduler and math around the number of training steps.
@@ -852,12 +928,18 @@ def main():
     else:
         num_training_steps_for_scheduler = args.max_train_steps * accelerator.num_processes
 
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps_for_scheduler,
-        num_training_steps=num_training_steps_for_scheduler,
-    )
+    if args.lr_scheduler  != "multistep":
+
+        lr_scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps_for_scheduler,
+            num_training_steps=num_training_steps_for_scheduler,
+        )
+    else:
+        milestones = [40_000, 60_000, 80_000]
+        lr_scheduler = MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=0.1, verbose=True)
+
 
     # Prepare everything with our `accelerator`.
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -900,8 +982,9 @@ def main():
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_config = dict(vars(args))
-        tracker_config.pop("validation_prompts")
+        # tracker_config = dict(vars(args))
+        # tracker_config.pop("validation_images")
+        tracker_config = dict()     # TODO: record hyper parameters
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
     # Function for unwrapping if model was compiled with `torch.compile`.
@@ -955,6 +1038,7 @@ def main():
         range(0, args.max_train_steps),
         initial=initial_global_step,
         desc="Steps",
+        ncols=100,
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
@@ -1095,25 +1179,26 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
-                log_validation(
-                    vae,
-                    # text_encoder,
-                    # tokenizer,
-                    unet,
-                    args,
-                    accelerator,
-                    weight_dtype,
-                    global_step,
-                )
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
+            if accelerator.is_main_process:
+                if args.validation_images is not None and global_step % args.validation_steps == 0:
+                    if args.use_ema:
+                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                        ema_unet.store(unet.parameters())
+                        ema_unet.copy_to(unet.parameters())
+                    log_validation(
+                        vae,
+                        # text_encoder,
+                        # tokenizer,
+                        unet,
+                        args,
+                        accelerator,
+                        weight_dtype,
+                        global_step,
+                        validation_transform    # for those starting point inputs
+                    )
+                    if args.use_ema:
+                        # Switch back to the original UNet parameters.
+                        ema_unet.restore(unet.parameters())
 
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
@@ -1122,7 +1207,7 @@ def main():
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
 
-        pipeline = StableDiffusionPipeline.from_pretrained(
+        pipeline = LDMPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
             # text_encoder=text_encoder,
             vae=vae,
@@ -1134,7 +1219,7 @@ def main():
 
         # Run a final round of inference.
         images = []
-        if args.validation_prompts is not None:
+        if args.validation_images is not None:
             logger.info("Running inference for collecting generated images...")
             pipeline = pipeline.to(accelerator.device)
             pipeline.torch_dtype = weight_dtype
@@ -1150,7 +1235,7 @@ def main():
 
             for i in range(len(args.validation_prompts)):
                 with torch.autocast("cuda"):
-                    image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+                    image = pipeline(num_inference_steps=20, generator=generator).images[0]
                 images.append(image)
 
         # if args.push_to_hub:
