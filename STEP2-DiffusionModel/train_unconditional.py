@@ -60,7 +60,7 @@ import albumentations as A
 import cv2
 from PIL import Image
 from torch.optim.lr_scheduler import MultiStepLR
-from dataset import load_CT_slice, HWCarrayToCHWtensor, CTDataset
+from dataset import load_CT_slice, HWCarrayToCHWtensor, CTDataset, varifyh5
 
 
 if is_wandb_available():
@@ -202,7 +202,7 @@ def log_validation(vae, unet, args, accelerator, weight_dtype, epoch, validation
             autocast_ctx = torch.autocast(accelerator.device.type)
 
         with autocast_ctx:
-            uncond_image = pipeline(num_inference_steps=50, generator=generator).images[0]
+            uncond_image = pipeline(num_inference_steps=400, generator=generator).images[0]
             uncond_image = torch.from_numpy(np.array(uncond_image)).permute(2, 0, 1)[None]    # h w c -> 1 c h w
             # image_plus = CTpipeline(original_images[i], # NOTE: input CT as starting point
             #                 num_inference_steps=20, generator=generator).images[0]
@@ -672,7 +672,7 @@ def main():
     #     # )
 
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae",# revision=args.revision, variant=args.variant
+        args.finetuned_vae_name_or_path, subfolder="autoencoderkl_ema",# revision=args.revision, variant=args.variant
     )
 
     # unet = UNet2DConditionModel.from_pretrained(
@@ -808,6 +808,10 @@ def main():
         dataset = dict()
         dataset["train"] = [entry.path for entry in os.scandir(args.train_data_dir)
                             if entry.name.startswith("BDMAP_A") or entry.name.startswith("BDMAP_V")]    # FELIX data
+        dataset["train"] = sorted([entry.path.replace("ct.h5", "") 
+                                    for path in  dataset["train"] for entry in os.scandir(path) 
+                                        if entry.name == "ct.h5" and varifyh5(entry.path)]) # check if h5 file exist and is valid
+        
         if accelerator.is_local_main_process:
             print(f"\033[32mFound {len(dataset['train'])} FELIX CT scans for training...\033[0m")
         # dataset = load_dataset(
@@ -875,9 +879,9 @@ def main():
     #         return torch.from_numpy(img).permute(2, 0, 1)  # Convert (H, W, C) → (C, H, W)
     train_transforms = A.Compose([
         A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_LINEAR),
-        A.RandomResizedCrop((args.resolution, args.resolution), scale=(0.5, 1.0), ratio=(1., 1.), p=0.5),
+        A.RandomResizedCrop((args.resolution, args.resolution), scale=(0.75, 1.0), ratio=(1., 1.), p=0.5),
         A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=90, p=0.5),
+        A.RandomRotate90(p=0.5),
         HWCarrayToCHWtensor(p=1.),
     ])
     validation_transform = A.Compose([

@@ -10,6 +10,15 @@ import time
 from tqdm import tqdm
 import h5py
 
+def varifyh5(filename): # read the h5 file to see if the conversion is finished or not
+    try:
+        with h5py.File(filename, "r") as hf:   # can read successfully
+            pass
+        return True
+    except OSError:     # transform not complete
+        return False
+
+
 def load_CT_slice(ct_path, slice_idx=None):
     """For AbdomenAtlasPro data: ranging from [-1000, 1000], shape of (H W D) """
     with h5py.File(ct_path, 'r') as hf:
@@ -61,14 +70,17 @@ class CTDataset(Dataset):
         return ct_slice  # Shape: (C, H, W)
 
 if __name__ == "__main__":
-    train_data_dir = "/ccvl/net/ccvl15/tlin67/Dataset_raw/FELIXtemp/FELIXh5"
+    train_data_dir = "/mnt/T9/AbdomenAtlas/image_mask_h5"
     paths = sorted([entry.path for entry in os.scandir(train_data_dir)
-                            if entry.name.startswith("BDMAP_A") or entry.name.startswith("BDMAP_V")])[:100]
+                            if entry.name.startswith("BDMAP_A") or entry.name.startswith("BDMAP_V")])
+    paths = [entry.path.replace("ct.h5", "") for path in  paths
+                                            for entry in os.scandir(path) if entry.name == "ct.h5"]
+    print(len(paths), "CT scans found!")
 
 
     train_transforms = A.Compose([
         A.Resize(512, 512, interpolation=cv2.INTER_LINEAR),
-        A.RandomResizedCrop((512, 512), scale=(0.5, 1.0), ratio=(1., 1.), p=0.5),
+        A.RandomResizedCrop((512, 512), scale=(0.75, 1.0), ratio=(1., 1.), p=0.5),
         A.HorizontalFlip(p=0.5),
         A.Rotate(limit=90, p=0.5),
         HWCarrayToCHWtensor(p=1.),
