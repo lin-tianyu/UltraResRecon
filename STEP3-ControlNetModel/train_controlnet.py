@@ -46,9 +46,10 @@ from diffusers import (
     ControlNetModel,
     DDPMScheduler,
     StableDiffusionControlNetPipeline,
-    UNet2DConditionModel,
+    UNet2DConditionModel, UNet2DModel,
     UniPCMultistepScheduler,
 )
+from controlnet import CTTransformControlNetModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
@@ -60,7 +61,7 @@ if is_wandb_available():
     import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.33.0.dev0")
+# check_min_version("0.33.0.dev0")
 
 logger = get_logger(__name__)
 
@@ -77,20 +78,20 @@ def image_grid(imgs, rows, cols):
 
 
 def log_validation(
-    vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
+    vae, unet, controlnet, args, accelerator, weight_dtype, step, is_final_validation=False
 ):
     logger.info("Running validation... ")
 
     if not is_final_validation:
         controlnet = accelerator.unwrap_model(controlnet)
     else:
-        controlnet = ControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+        controlnet = CTTransformControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
 
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
+        # text_encoder=text_encoder,
+        # tokenizer=tokenizer,
         unet=unet,
         controlnet=controlnet,
         safety_checker=None,
@@ -251,6 +252,13 @@ These are controlnet weights trained on {base_model} with new type of conditioni
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a ControlNet training script.")
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -600,7 +608,7 @@ def parse_args(input_args=None):
     return args
 
 
-def make_train_dataset(args, tokenizer, accelerator):
+def make_train_dataset(args, accelerator):
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
@@ -658,24 +666,24 @@ def make_train_dataset(args, tokenizer, accelerator):
                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
             )
 
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if random.random() < args.proportion_empty_prompts:
-                captions.append("")
-            elif isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
+    # def tokenize_captions(examples, is_train=True):
+    #     captions = []
+    #     for caption in examples[caption_column]:
+    #         if random.random() < args.proportion_empty_prompts:
+    #             captions.append("")
+    #         elif isinstance(caption, str):
+    #             captions.append(caption)
+    #         elif isinstance(caption, (list, np.ndarray)):
+    #             # take a random caption if there are multiple
+    #             captions.append(random.choice(caption) if is_train else caption[0])
+    #         else:
+    #             raise ValueError(
+    #                 f"Caption column `{caption_column}` should contain either strings or lists of strings."
+    #             )
+    #     inputs = tokenizer(
+    #         captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+    #     )
+    #     return inputs.input_ids
 
     image_transforms = transforms.Compose(
         [
@@ -783,37 +791,37 @@ def main(args):
             ).repo_id
 
     # Load the tokenizer
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
-    elif args.pretrained_model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-            use_fast=False,
-        )
+    # if args.tokenizer_name:
+    #     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
+    # elif args.pretrained_model_name_or_path:
+    #     tokenizer = AutoTokenizer.from_pretrained(
+    #         args.pretrained_model_name_or_path,
+    #         subfolder="tokenizer",
+    #         revision=args.revision,
+    #         use_fast=False,
+    #     )
 
     # import correct text encoder class
-    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+    # text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
 
     # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-    )
+    noise_scheduler = DDPMScheduler.from_pretrained("stable-diffusion-v1-5/stable-diffusion-v1-5", subfolder="scheduler")
+    # text_encoder = text_encoder_cls.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    # )
     vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+        args.finetuned_vae_name_or_path, subfolder="autoencoderkl_ema",# revision=args.revision, variant=args.variant
     )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    unet = UNet2DModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet",# revision=args.revision, variant=args.variant
     )
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+        controlnet = CTTransformControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet)
+        controlnet = CTTransformControlNetModel.from_unet(unet)
 
     # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
     def unwrap_model(model):
@@ -843,7 +851,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = CTTransformControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -854,7 +862,7 @@ def main(args):
 
     vae.requires_grad_(False)
     unet.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+    # text_encoder.requires_grad_(False)
     controlnet.train()
 
     if args.enable_xformers_memory_efficient_attention:
@@ -918,7 +926,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = make_train_dataset(args, tokenizer, accelerator)
+    train_dataset = make_train_dataset(args, accelerator)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -960,7 +968,7 @@ def main(args):
     # Move vae, unet and text_encoder to device and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+    # text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1051,7 +1059,7 @@ def main(args):
                 )
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+                # encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
 
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
 
@@ -1126,8 +1134,8 @@ def main(args):
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
                         image_logs = log_validation(
                             vae,
-                            text_encoder,
-                            tokenizer,
+                            # text_encoder,
+                            # tokenizer,
                             unet,
                             controlnet,
                             args,
@@ -1154,8 +1162,8 @@ def main(args):
         if args.validation_prompt is not None:
             image_logs = log_validation(
                 vae=vae,
-                text_encoder=text_encoder,
-                tokenizer=tokenizer,
+                # text_encoder=text_encoder,
+                # tokenizer=tokenizer,
                 unet=unet,
                 controlnet=None,
                 args=args,

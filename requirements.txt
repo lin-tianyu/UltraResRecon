@@ -6,3 +6,4 @@ datasets
 albumentations
 wandb
 h5py
+transformers>=4.25.1

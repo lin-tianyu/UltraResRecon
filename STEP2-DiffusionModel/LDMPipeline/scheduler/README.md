@@ -1,1 +1,0 @@
-When changing scheduler is needed, choose one of `config_*.json` and copy-paste its content into `scheduler_config.json`.

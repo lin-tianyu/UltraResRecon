@@ -4,7 +4,11 @@ STEP1-AutoEncoderModel/klvae/klvae*/*
 STEP1-AutoEncoderModel/klvae/wandb/*
 
 STEP2-DiffusionModel/wandb/*
-STEP2-DiffusionModel/uncond-sd*/*
+STEP2-DiffusionModel/sd*/*
+
+STEP3-ControlNetModel/dataset/data/*
+STEP3-ControlNetModel/dataset/datah5/*
+STEP3-ControlNetModel/controlnet*/
 
 exampl*.png
 

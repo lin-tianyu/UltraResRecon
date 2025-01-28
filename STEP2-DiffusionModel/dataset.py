@@ -50,14 +50,15 @@ class HWCarrayToCHWtensor(A.ImageOnlyTransform):
         return torch.from_numpy(img).permute(2, 0, 1)  # (H, W, C) → (C, H, W)
 
 class CTDataset(Dataset):
-    def __init__(self, file_paths, transform=None):
+    def __init__(self, file_paths, image_transform=None, tokenizer=None):
         """ (training only)
         Args:
             file_paths (list): List of paths to 3D CT volumes (.nii.gz).
             transform (albumentations.Compose): Transformations to apply to 2D slices.
         """
         self.file_paths = file_paths
-        self.transform = transform
+        self.image_transform = image_transform
+        self.tokenizer = tokenizer
 
     def __len__(self):
         return len(self.file_paths)
@@ -65,9 +66,26 @@ class CTDataset(Dataset):
     def __getitem__(self, idx):
         ct_path = self.file_paths[idx]  # random CT
         ct_slice = load_CT_slice(os.path.join(ct_path, "ct.h5"))    # random slice
-        ct_slice = self.transform(image=ct_slice)["image"]  # data augmentation
+        ct_slice = self.image_transform(image=ct_slice)["image"]  # data augmentation
+        if ct_path.split("/")[-2].startswith("BDMAP_A"):
+            text_prompt = "An Arterial CT slice."
+        elif ct_path.split("/")[-2].startswith("BDMAP_V"):
+            text_prompt = "A Portal-venous CT slice."
+        else:
+            raise NotImplementedError("Only support Arterial (BDMAP_A) and Portal-venous (BDMAP_V) right now.")
 
-        return ct_slice  # Shape: (C, H, W)
+        example = dict()
+        example["pixel_values"] = ct_slice
+        example["input_ids"] = self.tokenize_caption(text_prompt)
+
+        return example  # Shape: (C, H, W)
+    
+    def tokenize_caption(self, text_prompt, is_train=True):
+        captions = text_prompt
+        inputs = self.tokenizer(
+            captions, max_length=self.tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        return inputs.input_ids 
 
 if __name__ == "__main__":
     train_data_dir = "/mnt/T9/AbdomenAtlas/image_mask_h5"
@@ -82,7 +100,7 @@ if __name__ == "__main__":
         A.Resize(512, 512, interpolation=cv2.INTER_LINEAR),
         A.RandomResizedCrop((512, 512), scale=(0.75, 1.0), ratio=(1., 1.), p=0.5),
         A.HorizontalFlip(p=0.5),
-        A.Rotate(limit=90, p=0.5),
+        A.RandomRotate90(p=0.5),
         HWCarrayToCHWtensor(p=1.),
     ])
 
