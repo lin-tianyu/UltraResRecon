@@ -15,6 +15,7 @@ accelerate launch train_controlnet.py \
     --max_train_steps=100_000 \
     --validation_steps=1000 \
     --checkpointing_steps=1000 \
+    --checkpoints_total_limit=5 \
     --report_to=wandb \
     --validation_image dataset/datah5/3A4asPCs6GI_noncontrast/ct.h5 dataset/datah5/3A4asPCs6GI_portal-venous/ct.h5 dataset/datah5/3A4asPCs6GI_delayed/ct.h5 \
     --validation_prompt "A delayed phase CT slice." "A noncontrast phase CT slice." "A portal-venous phase CT slice." \
