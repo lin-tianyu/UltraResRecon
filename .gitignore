@@ -16,5 +16,6 @@ STEP3-ControlNetModel/logs/*
 
 */__pycache__/*
 */*/*.zip
+*/*.out
 # STEP1-AutoEncoderModel/vqgan/__pycache__/*
 # STEP1-AutoEncoderModel/klvae/__pycache__/*
