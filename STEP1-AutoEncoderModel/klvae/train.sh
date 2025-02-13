@@ -13,5 +13,6 @@ accelerate launch train_klvae.py \
   --learning_rate=1e-4 \
   --validation_steps=1000 \
   --checkpointing_steps=1000 \
+  --checkpoints_total_limit=5 \
   --kl_weight=0 \
   --output_dir="vae_kl0_lr4_std"

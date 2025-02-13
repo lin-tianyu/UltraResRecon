@@ -28,7 +28,7 @@ if not TRAINED:                     # A. initialize the model from scratch
     kl_model_8 = AutoencoderKL.from_config(config)
 else:                               # B. load pre-trained model
     print("load pre-trained model")
-    kl_model_8 = AutoencoderKL.from_pretrained("STEP1-AutoEncoderModel/klvae/vae_kl6_lr4_std/checkpoint-119000", subfolder="vae")
+    kl_model_8 = AutoencoderKL.from_pretrained("STEP1-AutoEncoderModel/klvae/vae_kl6_lr4_std/checkpoint-100000", subfolder="vae")
 
 print(kl_model_8.config.scaling_factor)                             # scaling_factor doesn't matter for VQmodel
 data_dir = "/mnt/realccvl15/zzhou82/data/AbdomenAtlasPro/"

@@ -18,6 +18,7 @@ accelerate launch --mixed_precision="no" train_text_to_image.py \
   --report_to=wandb \
   --validation_steps=1000 \
   --checkpointing_steps=1000 \
+  --checkpoints_total_limit=5 \
   --validation_images ../../../Dataset_raw/FELIXtemp/FELIXh5/BDMAP_A0000001/ct.h5 ../../../Dataset_raw/FELIXtemp/FELIXh5/BDMAP_V0000001/ct.h5 \
   --validation_prompt 'An arterial phase CT slice.' 'A portal-venous phase CT slice.' \
   --vae_loss="l2" \
