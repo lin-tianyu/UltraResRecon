@@ -1,14 +1,24 @@
 STEP1-AutoEncoderModel/vqgan/vqgan*/*
 STEP1-AutoEncoderModel/vqgan/wandb/*
+STEP1-AutoEncoderModel/vqgan/logs/*
 STEP1-AutoEncoderModel/klvae/klvae*/*
+STEP1-AutoEncoderModel/klvae/vae*/*
 STEP1-AutoEncoderModel/klvae/wandb/*
+STEP1-AutoEncoderModel/klvae/logs/*
 
 STEP2-DiffusionModel/wandb/*
 STEP2-DiffusionModel/sd*/*
+STEP2-DiffusionModel/l2*/*
+STEP2-DiffusionModel/no*/*
+STEP2-DiffusionModel/text*/*
+STEP2-DiffusionModel/pics/*
+STEP2-DiffusionModel/logs/*
 
 STEP3-ControlNetModel/dataset/data/*
 STEP3-ControlNetModel/dataset/datah5/*
 STEP3-ControlNetModel/controlnet*/
+STEP3-ControlNetModel/wandb/*
+STEP3-ControlNetModel/logs/*
 
 exampl*.png
 

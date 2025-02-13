@@ -50,6 +50,7 @@ from diffusers.utils import check_min_version, is_wandb_available
 import nibabel as nib
 import albumentations as A
 import cv2
+import h5py
 
 if is_wandb_available():
     import wandb
@@ -143,35 +144,39 @@ def gradient_penalty(images, output, weight=10):
     gradients = torch.reshape(gradients, (bsz, -1))
     return weight * ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
+class HWCarrayToCHWtensor(A.ImageOnlyTransform):
+        def apply(self, img, **kwargs):
+            return torch.from_numpy(img).permute(2, 0, 1)  # Convert (H, W, C) → (C, H, W)
+
 def load_CT_slice(ct_path, slice_idx=None):
     """For AbdomenAtlasPro data: ranging from [-1000, 1000], shape of (H W D) """
-    nii = nib.load(ct_path)             # reading nii file, not loading to memory
-    z_shape = nii.shape[2]
+    with h5py.File(ct_path, 'r') as hf:
+        nii = hf['image']
+        z_shape = nii.shape[2]
 
-    # NOTE: take adjacent 3 slices into the 3 RGB channel
-    if slice_idx is None:
-        slice_idx = random.randint(0, z_shape - 3)   # `random.randint` includes end point
-    while True:
-        try:    # some slices of some CT are broken
-            ct_slice = np.asarray(nii.dataobj[:, :, slice_idx:slice_idx + 3]).astype(np.float32)   # lazy loading, prevent reading the entire CT
-            break
-        except: # if broken, randomly select until select the non-broken slice
-            print(f"\033[31mBroken slice: {ct_path.split('/')[-2]}, slice {slice_idx}\033[0m")
-            slice_idx = random.randint(0, z_shape - 3)
-    assert not np.any(np.isnan(ct_slice))
+        # NOTE: take adjacent 3 slices into the 3 RGB channel
+        if slice_idx is None:
+            slice_idx = random.randint(0, z_shape - 3)   # `random.randint` includes end point
+        # while True:
+        #     try:    # some slices of some CT are broken
+        ct_slice = nii[:, :, slice_idx:slice_idx + 3]   
+            #     break
+            # except: # if broken, randomly select until select the non-broken slice
+            #     print(f"\033[31mBroken slice: {ct_path.split('/')[-2]}, slice {slice_idx}\033[0m")
+            #     slice_idx = random.randint(0, z_shape - 3)
 
     # ct_slice = np.repeat(ct_slice, repeats=3, axis=2)    # (H W 1) -> (H W 3)
             
     # target range: [-1000, 1000] -> [-1, 1]
     ct_slice[ct_slice > 1000.] = 1000.    # clipping range and normalize
     ct_slice[ct_slice < -1000.] = -1000.
-    # ct_slice /= 1000                            # [-1000, 1000] --> [-1, 1]
     ct_slice = (ct_slice + 1000.) / 2000.       # [-1000, 1000] --> [0, 1]
     return ct_slice  # (H W 3)[0, 1]
 
 @torch.no_grad()
 def log_validation(model, args, validation_transform, accelerator, global_step):
     def postprocess_log_images(images): # (b c h w)[around 0, 1] tensor float32 -> (b h w c)[0, 255] numpy uint8
+        images = (images + 1) / 2
         images = torch.clamp(images, 0.0, 1.0)
         images *= 255.0
         images = images.permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
@@ -358,7 +363,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="klvae-output-KL-weight-0",
+        default="klvae-output",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -673,19 +678,19 @@ def main():
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
-                    ema_model.save_pretrained(os.path.join(output_dir, "autoencoderkl_ema"))
+                    ema_model.save_pretrained(os.path.join(output_dir, "vae_ema"))
                 AutoencoderKL = models[0]
-                AutoencoderKL.save_pretrained(os.path.join(output_dir, "autoencoderkl"))
+                AutoencoderKL.save_pretrained(os.path.join(output_dir, "vae"))
                 weights.pop()
 
         def load_model_hook(models, input_dir):
             if args.use_ema:
-                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "autoencoderkl_ema"), AutoencoderKL)
+                load_model = EMAModel.from_pretrained(os.path.join(input_dir, "vae_ema"), AutoencoderKL)
                 ema_model.load_state_dict(load_model.state_dict())
                 ema_model.to(accelerator.device)
                 del load_model
             AutoencoderKL = models.pop()
-            load_model = AutoencoderKL.from_pretrained(input_dir, subfolder="autoencoderkl")
+            load_model = AutoencoderKL.from_pretrained(input_dir, subfolder="vae")
             AutoencoderKL.register_to_config(**load_model.config)
             AutoencoderKL.load_state_dict(load_model.state_dict())
             del load_model
@@ -750,7 +755,11 @@ def main():
         #     data_files["train"] = os.path.join(args.train_data_dir, "*")
         dataset = dict()
         # dataset["train"] = glob.glob(os.path.join(data_files["train"]))
-        dataset["train"] = [entry.path for entry in os.scandir(args.train_data_dir)]    
+        dataset["train"] = [entry.path for entry in os.scandir(args.train_data_dir)
+                            if entry.name.startswith("BDMAP_A") or entry.name.startswith("BDMAP_V")]    # FELIX data
+        dataset["train"] = sorted([entry.path.replace("ct.h5", "") 
+                                    for path in  dataset["train"] for entry in os.scandir(path) 
+                                        if entry.name == "ct.h5"])
         if accelerator.is_local_main_process:
             print(f"\033[32mFound {len(dataset['train'])} CT scans. We train them all.\033[0m")
         # See more about loading custom images at
@@ -758,19 +767,29 @@ def main():
 
     # Preprocessing the datasets.
         # Custom transform to convert (H, W, C) -> (C, H, W)
-    class HWCarrayToCHWtensor(A.ImageOnlyTransform):
-        def apply(self, img, **kwargs):
-            return torch.from_numpy(img).permute(2, 0, 1)  # Convert (H, W, C) → (C, H, W)
+    
     train_transforms = A.Compose([
         A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_LINEAR),
         A.RandomResizedCrop((args.resolution, args.resolution), scale=(0.5, 1.0), ratio=(1., 1.), p=0.5),
         A.HorizontalFlip(p=0.5),
         A.Rotate(limit=90, p=0.5),
+        A.Normalize(
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+            max_pixel_value=1.0,
+            p=1.0
+        ),
         HWCarrayToCHWtensor(p=1.),
 
     ])
     validation_transform = A.Compose([
         A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_LINEAR),
+        A.Normalize(
+            mean=(0.5, 0.5, 0.5),
+            std=(0.5, 0.5, 0.5),
+            max_pixel_value=1.0,
+            p=1.0
+        ),
         HWCarrayToCHWtensor(p=1.),
     ])
 
@@ -789,7 +808,7 @@ def main():
 
     def collate_fn(ct_paths):
         pixel_values = torch.stack([train_transforms(
-            image=load_CT_slice(os.path.join(ct_path, "ct.nii.gz")))["image"] for ct_path in ct_paths])
+            image=load_CT_slice(os.path.join(ct_path, "ct.h5")))["image"] for ct_path in ct_paths])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         return {"pixel_values": pixel_values}
 

@@ -27,6 +27,7 @@ import accelerate
 import datasets
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
@@ -54,7 +55,9 @@ from diffusers.utils.torch_utils import is_compiled_module
 import albumentations as A
 import cv2
 from PIL import Image
-from dataset import load_CT_slice, HWCarrayToCHWtensor, CTDataset, varifyh5
+from dataset import load_CT_slice, HWCarrayToCHWtensor, CTDataset, varifyh5, edge_clahe_sobel, edge_clahe_canny
+from diffusers import DDIMScheduler, StableDiffusionImg2ImgPipeline
+from pipeline import ConcatInputStableDiffusionPipeline, init_unet
 
 if is_wandb_available():
     import wandb
@@ -141,23 +144,31 @@ More information on all the CLI arguments and the environment are available on y
 
     model_card.save(os.path.join(repo_folder, "README.md"))
 
-
-def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
+@torch.no_grad()
+def log_validation(vae, text_encoder, tokenizer, unet, scheduler, args, accelerator, weight_dtype, epoch, cond_transforms):
     logger.info("Running validation... ")
+    dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        dtype = torch.bfloat16
+    
+    scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    pipeline = StableDiffusionPipeline.from_pretrained(
+    pipeline = ConcatInputStableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         vae=accelerator.unwrap_model(vae),
         text_encoder=accelerator.unwrap_model(text_encoder),
         tokenizer=tokenizer,
         unet=accelerator.unwrap_model(unet),
+        scheduler=scheduler,    
         safety_checker=None,
         revision=args.revision,
         variant=args.variant,
         torch_dtype=weight_dtype,
     )
     pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
+    pipeline.set_progress_bar_config(disable=False)
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
@@ -168,16 +179,39 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
     images = []
+    cond_images = []
+    slice_idx = 150
     for i in range(len(args.validation_prompts)):
+        cond_image = load_CT_slice(args.validation_images[i], slice_idx=slice_idx)
+        cond_image = cond_transforms(image=cond_image)["image"]
+
+        cond_image_edge_map = edge_clahe_canny(cond_image * 255) / 255
+        cond_image = HWCarrayToCHWtensor(p=1.)(
+            image=A.Normalize(
+                mean=(0.5, 0.5, 0.5),
+                std=(0.5, 0.5, 0.5),
+                max_pixel_value=1.0,
+                p=1.0
+            )(image=cond_image_edge_map)["image"]
+        )["image"].to(accelerator.device, dtype=dtype)[None]
+
+        cond_latents = vae.encode(cond_image.to(weight_dtype)).latent_dist.sample()
+        cond_latents = cond_latents * vae.config.scaling_factor
+        latents = torch.randn_like(cond_latents)
         if torch.backends.mps.is_available():
             autocast_ctx = nullcontext()
         else:
             autocast_ctx = torch.autocast(accelerator.device.type)
 
         with autocast_ctx:
-            image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
+            image = pipeline(args.validation_prompts[i], 
+                                num_inference_steps=50, 
+                                generator=generator,
+                                latents=latents,
+                                cond_latents=cond_latents).images[0]
 
         images.append(image)
+        cond_images.append(cond_image_edge_map)
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
@@ -189,6 +223,10 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
                     "validation": [
                         wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
                         for i, image in enumerate(images)
+                    ],
+                    "cond_image": [
+                        wandb.Image(image, caption=f"{i}: {args.validation_prompts[i]}")
+                        for i, image in enumerate(cond_images)
                     ]
                 }
             )
@@ -276,6 +314,13 @@ def parse_args():
             "For debugging purposes or quicker training, truncate the number of training examples to this "
             "value if set."
         ),
+    )
+    parser.add_argument(
+        "--validation_images",
+        type=str,
+        default=None,
+        nargs="+",
+        help=("A set of validation images evaluated every `--validation_steps` and logged to `--report_to`."),
     )
     parser.add_argument(
         "--validation_prompts",
@@ -508,6 +553,12 @@ def parse_args():
         help="Run validation every X epochs.",
     )
     parser.add_argument(
+        "--vae_loss",
+        type=str,
+        default="l2",
+        help="The loss function for vae reconstruction loss.",
+    )
+    parser.add_argument(
         "--tracker_project_name",
         type=str,
         default="text2image-fine-tune",
@@ -627,15 +678,20 @@ def main():
             args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
         )
         vae = AutoencoderKL.from_pretrained(
-            args.finetuned_vae_name_or_path, subfolder="autoencoderkl_ema", revision=args.revision, variant=args.variant
+            args.finetuned_vae_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
         )
+        # vae = AutoencoderKL.from_pretrained(
+        #     args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+        # )
 
+    
+    unet = init_unet(args.pretrained_model_name_or_path, zero_cond_conv_in=True)
     # unet = UNet2DConditionModel.from_pretrained(
     #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     # )
-    unet_config_file = "./StableDiffusionPipeline/unet/config.json"         # NOTE: pre-defined!
-    unect_config = UNet2DConditionModel.load_config(unet_config_file)
-    unet = UNet2DConditionModel.from_config(unect_config)
+    # unet_config_file = "./StableDiffusionPipeline/unet/config.json"         # NOTE: pre-defined!
+    # unect_config = UNet2DConditionModel.load_config(unet_config_file)
+    # unet = UNet2DConditionModel.from_config(unect_config)
 
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
@@ -768,7 +824,7 @@ def main():
                             if entry.name.startswith("BDMAP_A") or entry.name.startswith("BDMAP_V")]    # FELIX data
         dataset["train"] = sorted([entry.path.replace("ct.h5", "") 
                                     for path in  dataset["train"] for entry in os.scandir(path) 
-                                        if entry.name == "ct.h5" and varifyh5(entry.path)]) # check if h5 file exist and is valid
+                                        if entry.name == "ct.h5"]) # check if h5 file exist and is valid ( `and varifyh5(entry.path)`)
         if accelerator.is_local_main_process:
             print(f"\033[32mFound {len(dataset['train'])} FELIX CT scans for training...\033[0m")
 
@@ -829,14 +885,42 @@ def main():
         A.RandomResizedCrop((args.resolution, args.resolution), scale=(0.75, 1.0), ratio=(1., 1.), p=0.5),
         A.HorizontalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        HWCarrayToCHWtensor(p=1.),
-    ])
-    validation_transform = A.Compose([
-        A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_LINEAR),
-        HWCarrayToCHWtensor(p=1.),
+        # A.Normalize(
+        #     mean=(0.5, 0.5, 0.5),
+        #     std=(0.5, 0.5, 0.5),
+        #     max_pixel_value=1.0,
+        #     p=1.0
+        # ),
+        # HWCarrayToCHWtensor(p=1.),
     ])
 
-    train_dataset = CTDataset(dataset["train"], image_transform=train_transforms, tokenizer=tokenizer)
+    downsampling_factor = 2
+    cond_transforms = A.Compose([   # NOTE: degrade!!! for the model to recover details
+        # A.Resize(args.resolution // downsampling_factor, args.resolution // downsampling_factor, interpolation=cv2.INTER_CUBIC),
+        A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_CUBIC),
+        # A.GaussianBlur(blur_limit=5, sigma_limit=(0.5, 1.5), p=1.),   # blur after degradation
+        # A.Normalize(
+        #     mean=(0.5, 0.5, 0.5),
+        #     std=(0.5, 0.5, 0.5),
+        #     max_pixel_value=1.0,
+        #     p=1.0
+        # ),
+        # HWCarrayToCHWtensor(p=1.),
+    ])
+    validation_transforms = A.Compose([   # NOTE: degrade!!! for the model to recover details
+        # A.Resize(args.resolution // downsampling_factor, args.resolution // downsampling_factor, interpolation=cv2.INTER_CUBIC),
+        A.Resize(args.resolution, args.resolution, interpolation=cv2.INTER_CUBIC),
+        # A.GaussianBlur(blur_limit=5, sigma_limit=(0.5, 1.5), p=1.),   # blur after degradation
+        # A.Normalize(
+        #     mean=(0.5, 0.5, 0.5),
+        #     std=(0.5, 0.5, 0.5),
+        #     max_pixel_value=1.0,
+        #     p=1.0
+        # ),
+        # HWCarrayToCHWtensor(p=1.),
+    ])
+
+    train_dataset = CTDataset(dataset["train"], image_transforms=train_transforms, cond_transforms=cond_transforms, tokenizer=tokenizer)
 
     # def preprocess_train(examples):
     #     images = [image.convert("RGB") for image in examples[image_column]]
@@ -853,8 +937,10 @@ def main():
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        cond_pixel_values = torch.stack([example["cond_pixel_values"] for example in examples])
+        cond_pixel_values = cond_pixel_values.to(memory_format=torch.contiguous_format).float()
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        return {"pixel_values": pixel_values, "input_ids": input_ids, "cond_pixel_values": cond_pixel_values}
 
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
@@ -987,10 +1073,20 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            # # calculate rescale factor!!! before training starts
+            # if global_step == initial_global_step: 
+            #     print(f"### Changing `scaling_factor` from \033[31m{vae.config.scaling_factor}\033[0m", end=" ")
+            #     latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.mode()
+            #     vae.config.scaling_factor = 1. / latents.std()
+            #     print(f"--> to \033[32m{vae.config.scaling_factor:.5f}\033[0m ###")
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
+
+                # Convert degraded condition images to latent space
+                cond_latents = vae.encode(batch["cond_pixel_values"].to(weight_dtype)).latent_dist.sample()
+                cond_latents = cond_latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -1041,10 +1137,16 @@ def main():
                     )
 
                 # Predict the noise residual and compute loss
+                noisy_latents = torch.cat([noisy_latents, cond_latents], dim=1)  # original latents for conditioning
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
                 if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    if args.vae_loss == "l2":
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    elif args.vae_loss == "l1":
+                        loss = F.l1_loss(model_pred.float(), target.float(), reduction="mean")
+                    else:
+                        raise NotImplementedError("Choose `vae_loss` from 'l1' and 'l2'!")
                 else:
                     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
@@ -1130,10 +1232,12 @@ def main():
                         text_encoder,
                         tokenizer,
                         unet,
+                        noise_scheduler, 
                         args,
                         accelerator,
                         weight_dtype,
                         global_step,
+                        validation_transforms
                     )
                     if args.use_ema:
                         # Switch back to the original UNet parameters.

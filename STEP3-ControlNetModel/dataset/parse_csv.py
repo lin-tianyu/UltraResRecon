@@ -47,33 +47,33 @@ if __name__ == "__main__":
     # df_pivot.to_excel("step2.xlsx")
 
     """Step 3: check shapes for selection (and get BDMAP_ID)"""
-    # choose phase by the maximum resolution
-    df_shapes = pd.read_excel("step2.xlsx")
-    # df_shapes = df_transformed.copy()
-    df_final = df_shapes.copy()
-    for row_idx, row in df_shapes.iterrows():
-        print(f"Patient-{row_idx}: {row['Patient_ID']}")  # Access patient ID
-        for col_idx, phase in enumerate(df_shapes.columns[2:]):  # Skip the first and second column (Patient_ID)
-            bdmap_ids = row[phase]  # Get BDMAP_ID(s) for the phase
-            if not isinstance(bdmap_ids, float) or not pd.isna(bdmap_ids):  # Ensure it's not NaN
-                bdmap_ids = bdmap_ids if isinstance(bdmap_ids, list) else [bdmap_ids]  # Ensure it's a list
-                print(f"\tPhase: {phase}")
-                print(f"\t\tBDMAP_ID: {bdmap_ids[0]}")
-                bdmap_shapes = [nib.load(os.path.join(BDMAP_root, bdmap_id, "ct.nii.gz")).shape for bdmap_id in list(eval(bdmap_ids[0]))]
-                bdmap_res = list(map(lambda x: sum(x), bdmap_shapes))
-                max_res_index = bdmap_res.index(max(bdmap_res))
-                print(f"\t\tBDMAP_shapes: {bdmap_shapes}  -- max res --> {bdmap_shapes[max_res_index]}")
-                df_shapes.iloc[row_idx, col_idx + 2] = str(bdmap_shapes[max_res_index])
-                df_final.iloc[row_idx, col_idx + 2] = list(eval(bdmap_ids[0]))[max_res_index]
-            else:
-                print("### Nan:", row[1], phase)
+    # # choose phase by the maximum resolution
+    # df_shapes = pd.read_excel("step2.xlsx")
+    # # df_shapes = df_transformed.copy()
+    # df_final = df_shapes.copy()
+    # for row_idx, row in df_shapes.iterrows():
+    #     print(f"Patient-{row_idx}: {row['Patient_ID']}")  # Access patient ID
+    #     for col_idx, phase in enumerate(df_shapes.columns[2:]):  # Skip the first and second column (Patient_ID)
+    #         bdmap_ids = row[phase]  # Get BDMAP_ID(s) for the phase
+    #         if not isinstance(bdmap_ids, float) or not pd.isna(bdmap_ids):  # Ensure it's not NaN
+    #             bdmap_ids = bdmap_ids if isinstance(bdmap_ids, list) else [bdmap_ids]  # Ensure it's a list
+    #             print(f"\tPhase: {phase}")
+    #             print(f"\t\tBDMAP_ID: {bdmap_ids[0]}")
+    #             bdmap_shapes = [nib.load(os.path.join(BDMAP_root, bdmap_id, "ct.nii.gz")).shape for bdmap_id in list(eval(bdmap_ids[0]))]
+    #             bdmap_res = list(map(lambda x: sum(x), bdmap_shapes))
+    #             max_res_index = bdmap_res.index(max(bdmap_res))
+    #             print(f"\t\tBDMAP_shapes: {bdmap_shapes}  -- max res --> {bdmap_shapes[max_res_index]}")
+    #             df_shapes.iloc[row_idx, col_idx + 2] = str(bdmap_shapes[max_res_index])
+    #             df_final.iloc[row_idx, col_idx + 2] = list(eval(bdmap_ids[0]))[max_res_index]
+    #         else:
+    #             print("### Nan:", row[1], phase)
             
-    df_final["same_res"] = df_shapes[df_shapes.columns[2:5]].apply(lambda row: row.nunique() == 1, axis=1)   # add same resolution flag
-    df_final = df_final.drop(columns=["Unnamed: 0"], errors="ignore")  # Won't error if column isn't there
-    df_final.to_excel("step3-ids.xlsx")
-    df_shapes["same_res"] = df_shapes[df_shapes.columns[2:5]].apply(lambda row: row.nunique() == 1, axis=1)  # add same resolution flag
-    df_shapes = df_shapes.drop(columns=["Unnamed: 0"], errors="ignore")  # Won't error if column isn't there
-    df_shapes.to_excel("step3-shapes.xlsx")
+    # df_final["same_res"] = df_shapes[df_shapes.columns[2:5]].apply(lambda row: row.nunique() == 1, axis=1)   # add same resolution flag
+    # df_final = df_final.drop(columns=["Unnamed: 0"], errors="ignore")  # Won't error if column isn't there
+    # df_final.to_excel("step3-ids.xlsx")
+    # df_shapes["same_res"] = df_shapes[df_shapes.columns[2:5]].apply(lambda row: row.nunique() == 1, axis=1)  # add same resolution flag
+    # df_shapes = df_shapes.drop(columns=["Unnamed: 0"], errors="ignore")  # Won't error if column isn't there
+    # df_shapes.to_excel("step3-shapes.xlsx")
 
 
     """Step 4: softlinking nii.gz file"""
@@ -89,7 +89,7 @@ if __name__ == "__main__":
                 os.makedirs(output_niigz_root, exist_ok=True)
                 output_niigz_path = os.path.join(output_niigz_root, "ct.nii.gz")
                 print(f"\t{BDMAP_niigz_path} --> {output_niigz_path}")
-                os.symlink(BDMAP_niigz_path, output_niigz_path)
+                # os.symlink(BDMAP_niigz_path, output_niigz_path)
             else:
                 print("### Nan:", row[1], phase)
 
